@@ -1,0 +1,105 @@
+name: Build TWRP (vendor_boot)
+
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_BRANCH:
+        description: 'TWRP minimal manifest branch'
+        required: true
+        default: 'twrp-12.1'
+      DEVICE_TREE_URL:
+        description: 'Device tree repository'
+        required: true
+        default: 'https://github.com/Mayuri-Chan/recovery_device_xiaomi_pond'
+      DEVICE_TREE_BRANCH:
+        description: 'Device tree branch'
+        required: true
+        default: 'twrp-12.1'
+      DEVICE_PATH:
+        description: 'Where to place the tree'
+        required: true
+        default: 'device/xiaomi/pond'
+      DEVICE_NAME:
+        description: 'Device codename (output folder name)'
+        required: true
+        default: 'pond'
+      MAKEFILE_NAME:
+        description: 'Product name from AndroidProducts.mk'
+        required: true
+        default: 'twrp_pond'
+      BUILD_TARGET:
+        description: 'Image to build (vendorbootimage / bootimage / recoveryimage)'
+        required: true
+        default: 'vendorbootimage'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev libc6-dev-i386 libncurses5 x11proto-core-dev libx11-dev lib32z1-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig python3 python-is-python3 \
+            ccache lz4 liblz4-tool bc
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "builder"
+          git config --global user.email "builder@example.com"
+
+      - name: Sync TWRP minimal manifest
+        run: |
+          mkdir -p ~/twrp && cd ~/twrp
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b ${{ github.event.inputs.MANIFEST_BRANCH }}
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+          df -h /
+
+      - name: Clone device tree
+        run: |
+          cd ~/twrp
+          git clone --depth 1 -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+            ${{ github.event.inputs.DEVICE_TREE_URL }} ${{ github.event.inputs.DEVICE_PATH }}
+          echo "--- prebuilt folder ---"
+          ls -la ${{ github.event.inputs.DEVICE_PATH }}/prebuilt || true
+
+      - name: Build
+        run: |
+          cd ~/twrp
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          source build/envsetup.sh
+          lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+          mka adbd ${{ github.event.inputs.BUILD_TARGET }} -j$(nproc --all) 2>&1 | tee ~/build.log
+
+      - name: Check image size
+        run: |
+          cd ~/twrp/out/target/product/${{ github.event.inputs.DEVICE_NAME }}
+          ls -l *.img
+          if [ -f vendor_boot.img ]; then
+            size=$(stat -c%s vendor_boot.img)
+            echo "vendor_boot.img = $size bytes (limit 67108864)"
+            [ "$size" -le 67108864 ] || { echo "Image too large for the vendor_boot partition"; exit 1; }
+          fi
+
+      - name: Upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-${{ github.event.inputs.DEVICE_NAME }}
+          path: ~/twrp/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.img
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ~/build.log
